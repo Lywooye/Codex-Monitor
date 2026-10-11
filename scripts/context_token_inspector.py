@@ -11,6 +11,8 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
+from usage_accounting import Ledger
+
 
 DEFAULT_ROOTS = [
     Path.home() / ".codex" / "sessions",
@@ -47,238 +49,78 @@ def read_jsonl(path: Path) -> Iterable[dict[str, Any]]:
                 yield row
 
 
-def read_jsonl_reverse(path: Path, chunk_size: int = 1024 * 256) -> Iterable[dict[str, Any]]:
-    with path.open("rb") as handle:
-        handle.seek(0, os.SEEK_END)
-        position = handle.tell()
-        buffer = b""
-        while position > 0:
-            read_size = min(chunk_size, position)
-            position -= read_size
-            handle.seek(position)
-            buffer = handle.read(read_size) + buffer
-            lines = buffer.split(b"\n")
-            buffer = lines[0]
-            for line in reversed(lines[1:]):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(row, dict):
-                    yield row
-        if buffer.strip():
-            try:
-                row = json.loads(buffer)
-            except json.JSONDecodeError:
-                return
-            if isinstance(row, dict):
-                yield row
-
-
-def token_count_payload(row: dict[str, Any]) -> dict[str, Any] | None:
-    if row.get("type") != "event_msg":
-        return None
-    payload = row.get("payload")
-    if not isinstance(payload, dict) or payload.get("type") != "token_count":
-        return None
-    info = payload.get("info")
-    return info if isinstance(info, dict) else None
-
-
 def summarize_session(path: str | Path) -> dict[str, Any]:
-    path = Path(path).expanduser()
-    meta: dict[str, Any] = {}
-    latest_token_event: dict[str, Any] | None = None
-    latest_token_timestamp: str | None = None
-    token_events = 0
-    last_timestamp: str | None = None
-
-    for row in read_jsonl(path):
-        timestamp = row.get("timestamp")
-        if isinstance(timestamp, str):
-            last_timestamp = timestamp
-
-        if row.get("type") == "session_meta" and isinstance(row.get("payload"), dict):
-            meta = row["payload"]
-
-        token_info = token_count_payload(row)
-        if token_info is not None:
-            token_events += 1
-            latest_token_event = token_info
-            latest_token_timestamp = timestamp if isinstance(timestamp, str) else None
-
-    last_usage = (latest_token_event or {}).get("last_token_usage") or {}
-    total_usage = (latest_token_event or {}).get("total_token_usage") or {}
-    context_window = (latest_token_event or {}).get("model_context_window")
-
-    latest_context_tokens = as_int(last_usage.get("input_tokens"))
-    latest_context_percent = pct(latest_context_tokens, as_int(context_window))
-
-    return {
-        "path": str(path),
-        "thread_id": meta.get("id") or infer_thread_id(path),
-        "cwd": meta.get("cwd"),
-        "model_provider": meta.get("model_provider"),
-        "created_at": meta.get("timestamp"),
-        "updated_at": latest_token_timestamp or last_timestamp,
-        "token_events": token_events,
-        "context_window": as_int(context_window),
-        "latest_context_tokens": latest_context_tokens,
-        "latest_context_percent": latest_context_percent,
-        "latest_turn_total_tokens": as_int(last_usage.get("total_tokens")),
-        "latest_turn_input_tokens": as_int(last_usage.get("input_tokens")),
-        "latest_turn_cached_input_tokens": as_int(last_usage.get("cached_input_tokens")),
-        "latest_turn_output_tokens": as_int(last_usage.get("output_tokens")),
-        "latest_turn_reasoning_tokens": as_int(last_usage.get("reasoning_output_tokens")),
-        "session_total_tokens": as_int(total_usage.get("total_tokens")),
-        "session_input_tokens": as_int(total_usage.get("input_tokens")),
-        "session_cached_input_tokens": as_int(total_usage.get("cached_input_tokens")),
-        "session_output_tokens": as_int(total_usage.get("output_tokens")),
-        "session_reasoning_tokens": as_int(total_usage.get("reasoning_output_tokens")),
-    }
+    return parse_session_detail(path)["summary"]
 
 
 def summarize_session_fast(path: str | Path) -> dict[str, Any]:
+    # A final token_count alone misses remote compaction. Use the same ledger.
+    return session_index(path)["summary"]
+
+
+_INDEX_CACHE = {}
+
+
+def append_complete_rows(ledger, path, offset=0):
+    # Stream the full-history index: retaining decoded tool outputs and replayed
+    # compaction history can otherwise require gigabytes on the first scan.
+    with path.open('rb') as handle:
+        handle.seek(offset)
+        while line := handle.readline():
+            if not line.endswith(b'\n'):
+                break
+            offset = handle.tell()
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                ledger.append((row,))
+    return offset
+
+
+def session_index(path: str | Path) -> dict[str, Any]:
     path = Path(path).expanduser()
-    meta: dict[str, Any] = {}
-    latest_token_event: dict[str, Any] | None = None
-    latest_token_timestamp: str | None = None
-    last_timestamp: str | None = None
-
-    for row in read_jsonl(path):
-        timestamp = row.get("timestamp")
-        if isinstance(timestamp, str):
-            last_timestamp = timestamp
-        if row.get("type") == "session_meta" and isinstance(row.get("payload"), dict):
-            meta = row["payload"]
-            break
-
-    for row in read_jsonl_reverse(path):
-        timestamp = row.get("timestamp")
-        if last_timestamp is None and isinstance(timestamp, str):
-            last_timestamp = timestamp
-        token_info = token_count_payload(row)
-        if token_info is not None:
-            latest_token_event = token_info
-            latest_token_timestamp = timestamp if isinstance(timestamp, str) else None
-            break
-
-    usage = usage_summary_from_token_info(latest_token_event or {})
-    return {
-        "path": str(path),
-        "thread_id": meta.get("id") or infer_thread_id(path),
-        "cwd": meta.get("cwd"),
-        "model_provider": meta.get("model_provider"),
-        "created_at": meta.get("timestamp"),
-        "updated_at": latest_token_timestamp or last_timestamp,
-        "token_events": None,
-        **usage,
-    }
+    stat = path.stat()
+    key = str(path)
+    signature = (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+    cached = _INDEX_CACHE.get(key)
+    if cached and cached[0] == signature:
+        return cached[3]
+    appending = cached and signature[:2] == cached[0][:2] and stat.st_size > cached[0][3]
+    ledger = cached[2] if appending else Ledger(keep_messages=False)
+    offset = cached[1] if appending else 0
+    offset = append_complete_rows(ledger, path, offset)
+    result = ledger.result()
+    result["summary"]["path"] = str(path)
+    result["summary"]["thread_id"] = result["summary"].get("thread_id") or infer_thread_id(path)
+    result["summary"]["token_events"] = len(result["calls"])
+    compact = {"summary": result["summary"], "calls": result["calls"],
+        "snapshots": result["snapshots"], "thread_id": result["summary"]["thread_id"],
+        "account": ledger.meta.get("creator_account_id") or "unknown"}
+    _INDEX_CACHE[key] = (signature, offset, ledger, compact)
+    return compact
 
 
-def usage_summary_from_token_info(token_info: dict[str, Any]) -> dict[str, Any]:
-    last_usage = token_info.get("last_token_usage") or {}
-    total_usage = token_info.get("total_token_usage") or {}
-    context_window = token_info.get("model_context_window")
-    latest_context_tokens = as_int(last_usage.get("input_tokens"))
-    return {
-        "context_window": as_int(context_window),
-        "latest_context_tokens": latest_context_tokens,
-        "latest_context_percent": pct(latest_context_tokens, as_int(context_window)),
-        "latest_turn_total_tokens": as_int(last_usage.get("total_tokens")),
-        "latest_turn_input_tokens": as_int(last_usage.get("input_tokens")),
-        "latest_turn_cached_input_tokens": as_int(last_usage.get("cached_input_tokens")),
-        "latest_turn_output_tokens": as_int(last_usage.get("output_tokens")),
-        "latest_turn_reasoning_tokens": as_int(last_usage.get("reasoning_output_tokens")),
-        "session_total_tokens": as_int(total_usage.get("total_tokens")),
-        "session_input_tokens": as_int(total_usage.get("input_tokens")),
-        "session_cached_input_tokens": as_int(total_usage.get("cached_input_tokens")),
-        "session_output_tokens": as_int(total_usage.get("output_tokens")),
-        "session_reasoning_tokens": as_int(total_usage.get("reasoning_output_tokens")),
-    }
-
-
-def parse_session_detail(
-    path: str | Path,
-    summary: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def parse_session_detail(path: str | Path, summary=None) -> dict[str, Any]:
     path = Path(path).expanduser()
-    detail = {
-        "summary": summary if summary is not None else summarize_session(path),
-        "meta": {},
-        "messages": [],
-        "_pending_assistant_index": None,
-        "_current_turn_index": 0,
-    }
-    extend_session_detail(detail, read_jsonl(path), summary=summary)
+    detail = {"_ledger": Ledger(), "_path": str(path)}
+    detail["_read_offset"] = append_complete_rows(detail["_ledger"], path)
+    extend_session_detail(detail, ())
+    detail["summary"]["thread_id"] = detail["summary"].get("thread_id") or infer_thread_id(path)
     return detail
 
 
-def extend_session_detail(
-    detail: dict[str, Any],
-    rows: Iterable[dict[str, Any]],
-    summary: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Append JSONL rows to a previously parsed detail object.
-
-    Session files are append-only. The injector uses this state to avoid
-    reparsing a long conversation each time a new token-count row arrives.
-    """
-    meta = detail.setdefault("meta", {})
-    messages = detail.setdefault("messages", [])
-    pending_assistant_index = detail.get("_pending_assistant_index")
-    current_turn_index = detail.get("_current_turn_index", 0)
-
-    for row in rows:
-        payload = row.get("payload")
-        timestamp = row.get("timestamp")
-
-        if row.get("type") == "session_meta" and isinstance(payload, dict):
-            meta.clear()
-            meta.update(payload)
-            continue
-
-        if row.get("type") == "response_item" and isinstance(payload, dict):
-            if payload.get("type") == "message":
-                role = payload.get("role")
-                if role in {"user", "assistant"}:
-                    text = message_text(payload)
-                    if should_skip_message(role, text):
-                        continue
-                    if role == "user":
-                        current_turn_index += 1
-                    messages.append(
-                        {
-                            "timestamp": timestamp,
-                            "role": role,
-                            "text": text,
-                            "token_footer": None,
-                            "token_usage": None,
-                            "turn_index": current_turn_index if role == "assistant" and current_turn_index else None,
-                            "total_turns": None,
-                        }
-                    )
-                    if role == "assistant":
-                        pending_assistant_index = len(messages) - 1
-            continue
-
-        token_info = token_count_payload(row)
-        if token_info is not None and pending_assistant_index is not None:
-            usage = usage_summary_from_token_info(token_info)
-            messages[pending_assistant_index]["token_usage"] = usage
-            messages[pending_assistant_index]["token_footer"] = format_reply_footer(usage)
-            pending_assistant_index = None
-
-    for message in messages:
-        message["total_turns"] = current_turn_index or None
-
-    if summary is not None:
-        detail["summary"] = summary
-    detail["_pending_assistant_index"] = pending_assistant_index
-    detail["_current_turn_index"] = current_turn_index
+def extend_session_detail(detail: dict[str, Any], rows: Iterable[dict[str, Any]], summary=None) -> dict[str, Any]:
+    ledger = detail.setdefault("_ledger", Ledger())
+    ledger.append(rows)
+    detail.update(ledger.result())
+    detail["summary"]["path"] = detail.get("_path")
+    detail["summary"]["token_events"] = len(detail["calls"])
+    detail["_current_turn_index"] = len(ledger.turns)
+    for message in detail["messages"]:
+        if message.get("token_usage"):
+            message["token_footer"] = format_reply_footer(message["token_usage"])
     return detail
 
 
@@ -307,43 +149,10 @@ def read_jsonl_from_offset(path: str | Path, offset: int) -> tuple[list[dict[str
     return rows, offset + len(complete)
 
 
-def message_text(payload: dict[str, Any]) -> str:
-    content = payload.get("content")
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    parts: list[str] = []
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        text = item.get("text")
-        if isinstance(text, str):
-            parts.append(text)
-    return "\n\n".join(parts).strip()
-
-
-def should_skip_message(role: str, text: str) -> bool:
-    if role != "user":
-        return False
-    stripped = text.strip()
-    return stripped.startswith("<environment_context>") or stripped.startswith("<permissions instructions>")
-
-
 def render_markdownish(text: str) -> str:
     escaped = html.escape(text)
     escaped = escaped.replace("\n", "<br>")
     return escaped
-
-
-def as_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    return None
 
 
 def infer_thread_id(path: Path) -> str:

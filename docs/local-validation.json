@@ -1,0 +1,35 @@
+[
+  {
+    "sample": "S01",
+    "native_records": 790,
+    "expected_tokens": 100786345,
+    "observed_tokens": 100786345,
+    "native_turns": 23,
+    "turns_matched": 23,
+    "compaction_tokens": 2505864,
+    "tools": 755,
+    "seconds": 0.009
+  },
+  {
+    "sample": "S02",
+    "native_records": 217,
+    "expected_tokens": 27151505,
+    "observed_tokens": 27151505,
+    "native_turns": 16,
+    "turns_matched": 16,
+    "compaction_tokens": 861631,
+    "tools": 191,
+    "seconds": 0.004
+  },
+  {
+    "sample": "S03",
+    "native_records": 53,
+    "expected_tokens": 6159455,
+    "observed_tokens": 6159455,
+    "native_turns": 12,
+    "turns_matched": 12,
+    "compaction_tokens": 0,
+    "tools": 41,
+    "seconds": 0.002
+  }
+]

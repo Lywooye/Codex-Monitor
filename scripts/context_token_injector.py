@@ -28,10 +28,10 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import context_token_inspector as inspector
+from weekly_usage import estimate_weekly
 
 
 DEFAULT_PORT = 9222
-ASSISTANT_DETAIL_ITEM_LIMIT = 40
 DETAIL_SESSION_LIMIT = 6
 DETAIL_CACHE_LIMIT = 24
 _DETAIL_CACHE: dict[str, tuple[int, int, dict[str, Any]]] = {}
@@ -268,8 +268,21 @@ def build_payload(
     selected_thread_id: str | None,
     detail_limit: int = DETAIL_SESSION_LIMIT,
 ) -> dict[str, Any]:
-    files = inspector.session_files(paths, limit=limit)
-    summaries = [inspector.summarize_session_fast(path) for path in files]
+    all_files = inspector.session_files(paths)
+    for cached_path in set(inspector._INDEX_CACHE) - {str(p) for p in all_files}:
+        del inspector._INDEX_CACHE[cached_path]
+    indexed = []
+    unavailable = 0
+    for path in all_files:
+        try:
+            indexed.append(inspector.session_index(path))
+        except (OSError, ValueError):
+            unavailable += 1
+    # Quota denominators include all discovered local sessions, not the UI limit.
+    unique = {}
+    for entry in indexed:
+        unique.setdefault(entry["thread_id"], dict(entry["summary"]))
+    summaries = list(unique.values())[:limit]
     summaries = [summary for summary in summaries if summary.get("session_total_tokens")]
     by_thread: dict[str, dict[str, Any]] = {}
     for summary in summaries:
@@ -285,7 +298,7 @@ def build_payload(
         active_path = session_file_for_thread(paths, selected_thread_id)
         known_paths = {str(summary.get("path")) for summary in summaries}
         if active_path and str(active_path) not in known_paths:
-            summary = inspector.summarize_session_fast(active_path)
+            summary = dict(inspector.summarize_session_fast(active_path))
             normalized = normalize_thread_id(str(summary.get("thread_id") or ""))
             if normalized == normalize_thread_id(selected_thread_id) and summary.get("session_total_tokens"):
                 summaries.append(summary)
@@ -293,10 +306,19 @@ def build_payload(
                 by_thread[f"local:{normalized}"] = summary
                 active_selected = summary
 
+    quota_thread = (active_selected or selected or {}).get("thread_id")
+    quota = estimate_weekly(indexed, quota_thread)
+    if unavailable:
+        quota["warnings"].append("unreadable_session_files")
+        quota["unreadable_files"] = unavailable
+    for summary in summaries:
+        if summary.get("thread_id") == quota_thread:
+            summary["weekly"] = quota
     compact_summaries = []
     for summary in summaries:
         compact_summaries.append(
             {
+                **summary,
                 "thread_id": summary.get("thread_id"),
                 "thread_keys": thread_keys(summary.get("thread_id")),
                 "cwd": summary.get("cwd"),
@@ -335,7 +357,7 @@ def build_payload(
             if message.get("role") == "assistant" and message.get("token_usage")
         ]
         total_rounds = len(assistant_token_messages)
-        assistant_item_messages = assistant_token_messages[-ASSISTANT_DETAIL_ITEM_LIMIT:]
+        assistant_item_messages = assistant_token_messages
         assistant_start_index = total_rounds - len(assistant_item_messages)
         assistant_items = [
             {
@@ -348,6 +370,14 @@ def build_payload(
                     assistant_total_turns=total_rounds,
                 ),
                 "tokenUsage": message["token_usage"],
+                "turnId": message.get("turn_id"),
+                "tools": message["token_usage"].get("latest_turn_tools", []),
+                "toolCount": message["token_usage"].get("latest_turn_tool_count", 0),
+                "compactionTokens": message["token_usage"].get("latest_turn_compaction_tokens", 0),
+                "weeklyTotal": quota.get("turn_estimated_pp", {}).get(message.get("turn_id"))
+                    if summary.get("thread_id") == quota_thread else None,
+                "weeklyCurrent": quota.get("turn_current_pp", {}).get(message.get("turn_id"), 0)
+                    if summary.get("thread_id") == quota_thread and quota.get("current_pp") is not None else None,
                 "textPrefix": text_prefix(message.get("text")),
                 "roundIndex": message.get("turn_index") or index,
                 "totalRounds": message.get("total_turns") or total_rounds,
@@ -398,20 +428,21 @@ def cached_session_detail(path: str, summary: dict[str, Any]) -> dict[str, Any]:
         return inspector.parse_session_detail(path, summary=summary)
 
     cached = _DETAIL_CACHE.get(path)
-    if cached:
+    if cached and cached[2].get("_file_identity") == (stat.st_dev, stat.st_ino):
         cached_mtime, cached_offset, parsed = cached
         if cached_mtime == signature[0] and cached_offset == signature[1]:
             return parsed
         if signature[1] > cached_offset:
-            rows, next_offset = inspector.read_jsonl_from_offset(path, cached_offset)
-            inspector.extend_session_detail(parsed, rows, summary=summary)
+            next_offset = inspector.append_complete_rows(parsed["_ledger"], Path(path), cached_offset)
+            inspector.extend_session_detail(parsed, (), summary=summary)
             _DETAIL_CACHE[path] = (signature[0], next_offset, parsed)
             return parsed
 
     parsed = inspector.parse_session_detail(path, summary=summary)
     if path not in _DETAIL_CACHE and len(_DETAIL_CACHE) >= DETAIL_CACHE_LIMIT:
         _DETAIL_CACHE.pop(next(iter(_DETAIL_CACHE)))
-    _DETAIL_CACHE[path] = (signature[0], signature[1], parsed)
+    parsed["_file_identity"] = (stat.st_dev, stat.st_ino)
+    _DETAIL_CACHE[path] = (signature[0], parsed["_read_offset"], parsed)
     return parsed
 
 
@@ -458,7 +489,7 @@ INJECTION_SCRIPT = r"""
 (payload => {
   // Bump this only when closures or event handlers change. A long-lived
   // renderer may still contain an observer from an older plugin release.
-  const RUNTIME_VERSION = 6;
+  const RUNTIME_VERSION = 7;
   const ROOT_ID = 'codex-context-token-inspector-root';
   const STYLE_ID = 'codex-context-token-inspector-style';
   const FOOTER_ATTR = 'data-context-token-footer';
@@ -620,7 +651,9 @@ INJECTION_SCRIPT = r"""
   }
   function activeThreadId() {
     const row = activeSidebarRow();
-    return row ? rowThreadId(row) : null;
+    return (row && rowThreadId(row)) ||
+      document.querySelector('[data-conversation-id]')?.getAttribute('data-conversation-id') ||
+      document.querySelector('[data-above-composer-conversation-id]')?.getAttribute('data-above-composer-conversation-id') || null;
   }
   function ensureStyle() {
     let style = document.getElementById(STYLE_ID);
@@ -726,7 +759,10 @@ INJECTION_SCRIPT = r"""
         padding: 8px 9px;
         color: color-mix(in srgb, CanvasText 78%, transparent);
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        white-space: nowrap;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        max-height: 60vh;
+        overflow-y: auto;
       }
       .cti-credit {
         margin-top: 3px;
@@ -1083,127 +1119,20 @@ INJECTION_SCRIPT = r"""
       .trim();
   }
   function visibleItemForNode(node, index, items, used, visibleCount) {
-    const nodeText = normalizedText(node.textContent);
-    for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
-      if (used.has(itemIndex)) continue;
-      const prefix = normalizedText(items[itemIndex].textPrefix);
-      if (prefix && nodeText.includes(prefix)) {
-        used.add(itemIndex);
-        return items[itemIndex];
-      }
-    }
-    const fallbackStart = Math.max(0, items.length - visibleCount);
-    const fallbackIndex = fallbackStart + index;
-    if (items[fallbackIndex] && !used.has(fallbackIndex)) {
-      used.add(fallbackIndex);
-      return items[fallbackIndex];
-    }
-    return null;
-  }
-  function detailCandidates(payload) {
-    if (payload.__ctiDetailCandidates) return payload.__ctiDetailCandidates;
-    const details = new Map();
-    if (payload.detail?.thread_id) details.set(String(payload.detail.thread_id), payload.detail);
-    Object.values(payload.detailsByThread || {}).forEach(detail => {
-      if (detail?.thread_id) details.set(String(detail.thread_id), detail);
-    });
-    payload.__ctiDetailCandidates = Array.from(details.values());
-    return payload.__ctiDetailCandidates;
-  }
-  function detailPrefixes(detail) {
-    if (detail.__ctiPrefixes) return detail.__ctiPrefixes;
-    const items = detail?.assistantItems || [];
-    detail.__ctiPrefixes = items
-      .map((item, index) => ({ index, prefix: normalizedText(item.textPrefix) }))
-      .filter(item => item.prefix.length >= 24);
-    return detail.__ctiPrefixes;
-  }
-  function scoreDetailForNodes(detail, nodes) {
-    if (!nodes.length) return 0;
-    const prefixes = detailPrefixes(detail);
-    if (!prefixes.length) return 0;
-    let score = 0;
-    const used = new Set();
-    for (const node of nodes) {
+    const turn = node.closest('[data-turn-key], [data-chatgpt-conversation-turn-id]');
+    const keys = [turn?.getAttribute('data-turn-key'), turn?.getAttribute('data-chatgpt-conversation-turn-id')].filter(Boolean);
+    let matches = items.map((item, i) => ({item, i})).filter(({item, i}) =>
+      !used.has(i) && item.turnId && keys.includes(item.turnId));
+    if (!matches.length) {
       const nodeText = normalizedText(node.textContent);
-      if (nodeText.length < 24) continue;
-      for (const item of prefixes) {
-        if (used.has(item.index)) continue;
-        const matchScore = textMatchScore(nodeText, item.prefix);
-        if (matchScore > 0) {
-          used.add(item.index);
-          score += matchScore;
-          break;
-        }
-      }
+      matches = items.map((item, i) => ({item, i})).filter(({item, i}) => {
+        const prefix = normalizedText(item.textPrefix);
+        return !used.has(i) && prefix.length >= 12 && nodeText.includes(prefix);
+      });
     }
-    return score;
-  }
-  function textChunks(value) {
-    return normalizedText(value)
-      .split(/[，。！？；：、,.!?;:\n\r()[\]{}<>《》"'“”‘’|]+/)
-      .map(chunk => chunk.trim())
-      .filter(chunk => chunk.length >= 6);
-  }
-  function textMatchScore(nodeText, prefix) {
-    if (nodeText.includes(prefix)) return 100 + Math.min(prefix.length, 120);
-    const nodeHead = nodeText.slice(0, Math.min(120, nodeText.length));
-    if (prefix.includes(nodeHead)) return 80 + Math.min(nodeHead.length, 120);
-    const prefixHead = prefix.slice(0, Math.min(80, prefix.length));
-    if (nodeText.includes(prefixHead)) return 60 + Math.min(prefixHead.length, 80);
-
-    let chunkScore = 0;
-    let chunkMatches = 0;
-    for (const chunk of textChunks(prefix)) {
-      if (nodeText.includes(chunk)) {
-        chunkMatches += 1;
-        chunkScore += Math.min(chunk.length, 40);
-      }
-    }
-    if (chunkMatches >= 2 || chunkScore >= 18) return chunkScore;
-
-    chunkScore = 0;
-    chunkMatches = 0;
-    for (const chunk of textChunks(nodeText)) {
-      if (prefix.includes(chunk)) {
-        chunkMatches += 1;
-        chunkScore += Math.min(chunk.length, 40);
-      }
-    }
-    if (chunkMatches >= 2 || chunkScore >= 18) return chunkScore;
-    return 0;
-  }
-  function detailForVisiblePage(payload) {
-    const nodes = assistantNodes();
-    if (!nodes.length) return null;
-    const signature = nodes
-      .map(node => normalizedText(node.textContent).slice(0, 180))
-      .join('||');
-    if (
-      payload.__ctiVisibleMatchCache &&
-      payload.__ctiVisibleMatchCache.signature === signature &&
-      payload.__ctiVisibleMatchCache.threadId
-    ) {
-      const cached = detailCandidates(payload).find(
-        detail => String(detail.thread_id) === String(payload.__ctiVisibleMatchCache.threadId)
-      );
-      if (cached) return cached;
-    }
-    let best = null;
-    let bestScore = 0;
-    for (const detail of detailCandidates(payload)) {
-      const score = scoreDetailForNodes(detail, nodes);
-      if (score > bestScore) {
-        best = detail;
-        bestScore = score;
-      }
-    }
-    payload.__ctiVisibleMatchCache = {
-      signature,
-      threadId: bestScore > 0 ? best?.thread_id : null,
-      score: bestScore,
-    };
-    return bestScore > 0 ? best : null;
+    if (matches.length !== 1) return null;
+    used.add(matches[0].i);
+    return matches[0].item;
   }
   function applyFooters(detail) {
     if (!detail) return;
@@ -1218,7 +1147,13 @@ INJECTION_SCRIPT = r"""
       node.querySelector(`[${FOOTER_ATTR}]`)?.remove();
       const sessionRound = item.roundIndex || index + 1;
       const sessionTotalRounds = item.totalRounds || items.length || targets.length;
-      const chipText = itemChip(item, sessionRound, sessionTotalRounds);
+      const extra = uiLanguage() === 'zh'
+        ? ` | 工具 ${item.toolCount || 0} 次 | 压缩 ${token(item.compactionTokens || 0)}`
+        : ` | Tools ${item.toolCount || 0} | Compaction ${token(item.compactionTokens || 0)}`;
+      const quotaText = item.weeklyTotal == null ? '' : (uiLanguage() === 'zh'
+        ? ` | 额度估算：累计 ${item.weeklyTotal.toFixed(2)} 个百分点 / 本周期 ${(item.weeklyCurrent == null ? '—' : item.weeklyCurrent.toFixed(2))}%`
+        : ` | Quota estimate: lifetime ${item.weeklyTotal.toFixed(2)} pp / current ${(item.weeklyCurrent == null ? '—' : item.weeklyCurrent.toFixed(2))}%`);
+      const chipText = itemChip(item, sessionRound, sessionTotalRounds) + extra + quotaText;
       const directChips = directReplyChips(host);
       // A v5 chip can be outside `node` after it is moved below the native
       // buttons. Look it up from the stable host first so refreshes reuse it.
@@ -1242,7 +1177,8 @@ INJECTION_SCRIPT = r"""
         host.appendChild(chip);
       }
       if (chip.textContent !== chipText) chip.textContent = chipText;
-      const title = itemTitle(item, sessionRound, sessionTotalRounds);
+      const toolText = (item.tools || []).map(t => `${t.name} × ${t.count} (${t.returned || 0} ${uiLanguage() === 'zh' ? '已返回' : 'returned'})`).join('\n');
+      const title = itemTitle(item, sessionRound, sessionTotalRounds) + (toolText ? '\n' + toolText : '');
       if (chip.getAttribute('title') !== title) chip.setAttribute('title', title);
     });
     // Remove duplicates created by older runtimes and chips whose virtualized
@@ -1256,7 +1192,7 @@ INJECTION_SCRIPT = r"""
     const root = ensureHud();
     const body = root.querySelector('[data-cti-body]');
     updateHudTitle(root);
-    const currentThreadId = currentDetail?.thread_id || activeThreadId() || payload.activeThreadId || null;
+    const currentThreadId = currentDetail?.thread_id || activeThreadId() || null;
     const summaryForThread = threadId => {
       if (!threadId) return null;
       const keys = threadKeys(threadId);
@@ -1266,16 +1202,13 @@ INJECTION_SCRIPT = r"""
     };
     const selected =
       payload.summaries.find(item => String(item.thread_id) === String(currentDetail?.thread_id)) ||
-      summaryForThread(currentThreadId) ||
-      summaryForThread(root.__ctiSelectedThreadId) ||
-      root.__ctiSelectedSummary ||
-      ((payload.summaries || []).length === 1 ? payload.summaries[0] : null);
+      summaryForThread(currentThreadId);
     if (!selected) {
+      root.__ctiSessionTotalTokens = null;
+      updateHudTitle(root);
       if (body.textContent !== tr('noRecords')) body.textContent = tr('noRecords');
       return;
     }
-    root.__ctiSelectedThreadId = selected.thread_id;
-    root.__ctiSelectedSummary = selected;
     root.__ctiSessionTotalTokens = selected.session_total_tokens;
     updateHudTitle(root);
     const turnBreakdown = joined([
@@ -1290,14 +1223,46 @@ INJECTION_SCRIPT = r"""
       `${tr('outputShort')} ${token(selected.session_output_tokens)}`,
       `${tr('reasoningShort')} ${token(selected.session_reasoning_tokens)}`,
     ]);
+    const esc = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const zh = uiLanguage() === 'zh';
+    const q = selected.weekly;
+    const amount = value => value == null ? (zh ? '未知' : 'unknown') : `≈${value.toFixed(2)}`;
+    const tools = (selected.latest_turn_tools || []).map(t => `${t.name} × ${t.count} (${t.returned || 0} ${uiLanguage() === 'zh' ? '已返回' : 'returned'})`).join(' · ');
+    const warningText = {
+      unobserved_legacy_prefix: ['早期累计用量已计入，但无法归属轮次与周期', 'Earlier cumulative usage is included; turn and time are unknown'],
+      legacy_counter_decreased: ['旧格式计数回退，可能缺失用量', 'Legacy counter decreased; usage may be missing'],
+      compaction_usage_unavailable: ['存在缺少用量的压缩记录；总数可能偏低', 'Compaction usage is missing; total may be low'],
+      native_record_without_response_id: ['用量记录缺少响应标识', 'Usage record has no response ID'],
+      account_identity_unavailable: ['账号标识缺失，可能混入其他账号', 'Account identity unavailable; accounts may be mixed'],
+      conflicting_snapshots: ['快照冲突区间未分摊', 'Conflicting snapshot intervals excluded'],
+      reset_boundary_unattributed: ['重置边界区间无法分摊', 'Reset boundary intervals cannot be attributed'],
+      quota_delta_without_local_tokens: ['部分额度增长没有对应的本机 tokens', 'Some quota growth has no matching local tokens'],
+      stale_quota_snapshot: ['已过期快照不参与分摊', 'Expired snapshots excluded'],
+      current_cycle_snapshot_unavailable: ['缺少本周期快照', 'Current cycle snapshot unavailable'],
+      unreadable_session_files: ['部分会话文件无法读取，分母不完整', 'Some session files are unreadable; denominator incomplete'],
+      uncovered_tokens: ['部分 tokens 缺少前后额度快照', 'Some tokens lack surrounding quota snapshots'],
+      session_not_indexed: ['当前会话未索引', 'Current session is not indexed'],
+    };
+    const warnings = [...new Set([...(selected.warnings || []), ...(q?.warnings || [])])]
+      .filter(code => warningText[code]).map(code => `<div>${esc(warningText[code][zh ? 0 : 1])}</div>`).join('');
+    const quotaHtml = q ? `<div>${zh ? '周额度分摊估算' : 'Weekly quota estimate'}: ${zh ? '本周期' : 'current'} ${amount(q.current_pp)}% / ${zh ? '跨周期累计' : 'lifetime'} ${amount(q.total_pp)} ${zh ? '个百分点' : 'pp'}</div>
+      <div>${zh ? '本机 token 观测覆盖' : 'Local token coverage'}: ${q.coverage_percent == null ? '—' : q.coverage_percent + '%'} · ${zh ? '受其他设备、模型权重、快照精度及延迟影响；误差无法量化' : 'Other devices, model weighting, rounding and delay affect estimates; error is not quantifiable'}</div>
+      <details><summary>${zh ? '各周期与数据缺口' : 'Cycles and gaps'}</summary>${(q.periods || []).map(p => `<div>${esc(new Date(p.resets_at*1000).toLocaleString())} ${zh ? '重置' : 'reset'} #${p.segment}: ≈${p.estimated_pp.toFixed(2)}%${p.current ? (zh ? '（本周期）' : ' (current)') : ''}</div>`).join('')}
+      ${warnings}<div>${zh ? '未覆盖 tokens' : 'Uncovered tokens'}: ${token(q.uncovered_tokens || 0)}</div></details>` : '';
     const bodyHtml = `
       <div>${labeled('status', `${pressure(selected.latest_context_percent)} | ${tr('left')} ${token(remainingContext(selected))}`)}</div>
       <div>${labeled('context', `${token(selected.latest_context_tokens)} / ${token(selected.context_window)} ${parenthesized(pct(selected.latest_context_percent))}`)}</div>
       <div>${labeled('turn', `${token(selected.latest_turn_total_tokens)} ${parenthesized(turnBreakdown)}`)}</div>
       <div>${labeled('session', `${token(selected.session_total_tokens)} ${parenthesized(sessionBreakdown)}`)}</div>
+      <div>${zh ? '压缩（已计入）' : 'Compaction (included)'}: ${token(selected.session_compaction_tokens || 0)}</div>
+      <div>${zh ? '工具调用：本轮 / 会话' : 'Tools: turn / session'}: ${selected.latest_turn_tool_count || 0} / ${selected.session_tool_count || 0}</div>
+      ${tools ? `<div>${esc(tools)}</div>` : ''}
+      ${quotaHtml || warnings}
       <div class="cti-credit">${tr('madeBy')}</div>
     `;
+    const cyclesExpanded = body.querySelector('details')?.open;
     if (body.innerHTML !== bodyHtml) body.innerHTML = bodyHtml;
+    if (cyclesExpanded && body.querySelector('details')) body.querySelector('details').open = true;
     const toggle = root.querySelector('[data-cti-toggle]');
     toggle.textContent = root.getAttribute('data-collapsed') === 'true' ? '+' : '−';
     updateUnitButtons(root);
@@ -1317,7 +1282,7 @@ INJECTION_SCRIPT = r"""
   }
   function detailForCurrentThread(payload) {
     const details = payload.detailsByThread || {};
-    for (const key of threadKeys(activeThreadId() || payload.activeThreadId)) {
+    for (const key of threadKeys(activeThreadId())) {
       if (details[key]) return details[key];
     }
     return null;
@@ -1336,7 +1301,7 @@ INJECTION_SCRIPT = r"""
       if (window.__codexContextTokenInspectorApplying) return;
       window.__codexContextTokenInspectorApplying = true;
       try {
-        const currentDetail = detailForCurrentThread(payload) || detailForVisiblePage(payload);
+        const currentDetail = detailForCurrentThread(payload);
         payload.currentDetailThreadId = currentDetail?.thread_id || null;
         applyHud(payload, currentDetail);
         if (currentDetail) {
@@ -1359,11 +1324,10 @@ INJECTION_SCRIPT = r"""
   function applyAll(payload) {
     window.__codexContextTokenInspectorApplying = true;
     try {
-      payload.activeThreadId = activeThreadId() || payload.activeThreadId;
+      payload.activeThreadId = activeThreadId();
       applySidebar(payload.summaries || []);
-      // The active sidebar row is the authoritative session identity. Visible
-      // text matching remains a fallback for app builds that omit that marker.
-      const currentDetail = detailForCurrentThread(payload) || detailForVisiblePage(payload);
+      // Never transfer usage labels between conversations based on similar text.
+      const currentDetail = detailForCurrentThread(payload);
       payload.currentDetailThreadId = currentDetail?.thread_id || null;
       applyHud(payload, currentDetail);
     } finally {
@@ -1426,7 +1390,7 @@ INJECTION_SCRIPT = r"""
   return {
     ok: true,
     summaries: (payload.summaries || []).length,
-    activeThreadId: activeThreadId() || payload.activeThreadId,
+    activeThreadId: activeThreadId(),
     selectedThreadId: payload.selectedThreadId,
     currentDetailThreadId: payload.currentDetailThreadId || null,
     assistantNodes: assistantNodes().length,

@@ -4,6 +4,15 @@
 
 English | [中文](README.zh-CN.md)
 
+> This fork is based on [KevinKE93/Codex-Monitor](https://github.com/KevinKE93/Codex-Monitor) and preserves the original author and MIT license. Version 0.4.0 adds full-turn accounting, compaction usage, tool calls, and weekly quota estimates split by reset cycle. Source and synthetic UI tests passed; no installation or injection into the real client was performed.
+
+- Sum every model call in a turn, deduplicated by response ID, including recorded compaction usage. Cached input and reasoning are subtotals, never added twice.
+- Show tool names, call counts and returned counts; a return does not imply success. Arguments and output bodies are not displayed.
+- Estimate quota from account snapshot deltas in proportion to local tokens. Show current cycle %, per-cycle breakdown, lifetime percentage points, coverage and gaps. Lifetime points may exceed 100.
+- Label the last assistant message of each turn. No 40-reply truncation, positional guesses, or cross-conversation text matching.
+
+See [accounting details and limits](docs/ACCOUNTING.md) and [validation](docs/VALIDATION.md).
+
 Codex Monitor is a local, read-only overlay for Codex in the current ChatGPT desktop app and the legacy standalone Codex Desktop app. It shows context-window usage and token consumption inside the existing window without patching the app bundle or copying session data into this repository.
 
 ![Codex Monitor demo](assets/codex-monitor-demo.svg)
@@ -32,13 +41,13 @@ Built by Kevin KE.
 Copy this GitHub URL:
 
 ```text
-https://github.com/KevinKE93/Codex-Monitor
+https://github.com/Lywooye/Codex-Monitor
 ```
 
 In Codex Desktop, open the plugin or marketplace install entry and paste the URL. If you prefer the CLI, run:
 
 ```bash
-codex plugin marketplace add https://github.com/KevinKE93/Codex-Monitor --ref main
+codex plugin marketplace add https://github.com/Lywooye/Codex-Monitor --ref main
 codex plugin add codex-monitor@codex-monitor
 ```
 
@@ -106,6 +115,11 @@ Use `./scripts/start_codex_monitor.sh 9222` for the automated path. It discovers
 
 ## Changelog
 
+### v0.4.0 (fork)
+
+- Full turns, compaction, tools and per-reset quota estimates with visible coverage gaps.
+- Stream the initial history scan and read appends incrementally; no new runtime dependency.
+
 ### v0.3.2
 
 - Prevented duplicate per-response token rows in multi-step tasks by assigning one stable chip to each native reply action row.
@@ -147,14 +161,14 @@ python3 ./scripts/context_token_inspector.py --limit 20 --format table
 | `context window` | Model context window reported by Codex token-count events. | `model_context_window` |
 | `left` | Estimated remaining context in the current request. | `context window - context` |
 | `Token: Current` | Current request context usage against the model context window. | `last_token_usage.input_tokens / model_context_window` |
-| `Token: Total` | Current assistant response token usage against cumulative current-session token usage. | `last_token_usage.total_tokens / total_token_usage.total_tokens` |
+| `Token: Total` | Full turn / current session usage, including recorded compaction. | Deduplicated native usage; cumulative deltas for legacy logs |
 | `session` | Current session total shown in the Monitor panel. It is not a sum across all conversations. | latest session JSONL |
 | `in` | Input tokens recorded by Codex. In the Monitor session line, this is cumulative session input. | `input_tokens` |
 | `cached` | Cached input tokens recorded by Codex. This can be high when repeated context is reused. | `cached_input_tokens` |
 | `out` | Output tokens produced by the assistant. | `output_tokens` |
 | `reason` | Reasoning output tokens recorded by Codex. | `reasoning_output_tokens` |
-| `user rounds` | Number of non-environment user messages in the current session. This is the human-facing conversation round count. | parsed user messages |
-| `assistant rounds` | Number of assistant messages in the current session that have token-count records. One user round may contain multiple assistant rounds because Codex can emit progress/status messages before the final answer. | parsed assistant messages with token usage |
+| `user rounds` | Task turns with usage or tools; user messages delimit legacy turns. | Native turn_id / legacy user messages |
+| `assistant rounds` | Turns with an assistant message; progress messages do not repeat full-turn usage. | Last assistant message of each turn |
 | `status` | Context pressure indicator. `OK` is below 70%, `WATCH` is 70% or above, and `HIGH` is 85% or above. | `context / context window` |
 | `raw / K / M` | Display unit for token values. `raw` shows the original integer, `K` shows thousands, and `M` shows millions. The default is `K`. | UI setting |
 

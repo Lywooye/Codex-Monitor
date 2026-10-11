@@ -1,0 +1,14 @@
+{
+  "cold": {
+    "seconds": 13.636,
+    "indexed_files": 2506,
+    "payload_bytes": 648952,
+    "peak_rss_MB": 452.1
+  },
+  "cached": {
+    "seconds": 0.178,
+    "indexed_files": 2506,
+    "payload_bytes": 648972,
+    "peak_rss_MB": 454.2
+  }
+}

@@ -1,13 +1,13 @@
 {
   "name": "codex-monitor",
-  "version": "0.3.2",
-  "description": "Local read-only monitor for Codex context and token usage in ChatGPT or Codex Desktop.",
+  "version": "0.4.0",
+  "description": "Local Codex turn/session tokens including compaction, tool calls, and estimated weekly quota by reset cycle.",
   "author": {
     "name": "Kevin Ke",
     "url": "https://github.com/KevinKE93"
   },
-  "homepage": "https://github.com/KevinKE93/Codex-Monitor",
-  "repository": "https://github.com/KevinKE93/Codex-Monitor",
+  "homepage": "https://github.com/Lywooye/Codex-Monitor",
+  "repository": "https://github.com/Lywooye/Codex-Monitor",
   "license": "MIT",
   "keywords": [
     "codex",

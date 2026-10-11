@@ -4,6 +4,15 @@
 
 [English](README.md) | 中文
 
+> 本 fork 基于 [KevinKE93/Codex-Monitor](https://github.com/KevinKE93/Codex-Monitor)，保留原作者及 MIT 许可。v0.4.0 增加完整轮次计数、压缩用量、工具调用及跨重置周期的周额度分摊估算。代码和合成页面已验收，尚未向真实客户端安装或注入。
+
+- **完整一轮**：合并该轮全部模型调用；单独显示已计入总数的压缩 tokens。按响应标识去重，不重复添加镜像计数。
+- **工具调用**：本轮/会话次数、工具名称及已返回次数；返回不代表执行成功，不展示参数或结果正文。
+- **周额度**：本周期百分比、各周期明细、跨周期累计百分点，均标明估算；显示本机 token 覆盖率和缺口。累计可超过 100 个百分点，不能理解为本周百分比。
+- **历史显示**：每轮最后一条助手消息承载整轮用量；移除 40 条截断与按位置猜配，聊天身份不明确时不贴标签。
+
+详见 [统计口径与限制](docs/ACCOUNTING.md) 和 [验收记录](docs/VALIDATION.md)。
+
 Codex Monitor 是一个本地只读的 Codex 监控浮层，同时支持当前集成在 ChatGPT 桌面客户端里的 Codex 和旧版独立 Codex Desktop。它可以在现有窗口中显示 context window 使用情况和 token 消耗，不修改客户端安装包，也不会把本地会话数据复制进仓库。
 
 ![Codex Monitor demo](assets/codex-monitor-demo.svg)
@@ -32,13 +41,13 @@ Codex Monitor 是一个本地只读的 Codex 监控浮层，同时支持当前�
 复制这个 GitHub URL：
 
 ```text
-https://github.com/KevinKE93/Codex-Monitor
+https://github.com/Lywooye/Codex-Monitor
 ```
 
 在 Codex Desktop 里打开 plugin 或 marketplace 安装入口，粘贴这个 URL。也可以用 CLI 安装：
 
 ```bash
-codex plugin marketplace add https://github.com/KevinKE93/Codex-Monitor --ref main
+codex plugin marketplace add https://github.com/Lywooye/Codex-Monitor --ref main
 codex plugin add codex-monitor@codex-monitor
 ```
 
@@ -66,7 +75,7 @@ LaunchAgent 会在 Codex 关闭时等待，不会在用户正常退出 Codex 后
 
 这是推荐方式。脚本会用本地 DevTools 端口打开 Codex，并持续运行 injector；当 Codex renderer 重启后，浮层会自动恢复。
 injector 默认每 10 秒刷新一次 session payload；普通的页面切换和 DOM 更新由页面内 observer 处理。
-为了减少卡顿，侧边栏 hover 的 summary 默认覆盖最近 100 个 session；每条消息后的 chip 详情默认只解析最近 6 个 session。如需给更早的 session 显示 chip，可以直接运行 `context_token_injector.py` 并设置 `--detail-limit`。
+为了减少卡顿，侧边栏 hover 的 summary 默认覆盖最近 100 个 session；每轮 chip 详情默认解析最近 6 个 session，并额外解析当前选中的旧会话。额度分摊的分母始终包含所有能读取的本地会话，不受这些显示数量限制。首次扫描完整历史，随后增量读取。
 长会话详情会保留缓存，后续只解析 JSONL 新追加的行，不会每次刷新都从头读取整个会话。
 如果请求的端口被占用，脚本只会在该端口确实属于 Codex renderer 时复用；否则自动切到下一个可用的本地端口。
 
@@ -105,6 +114,11 @@ Codex Monitor 注入的是临时 DOM 元素，这是有意设计的：它避免�
 自动化方式请使用 `./scripts/start_codex_monitor.sh 9222`。它会自动识别两个受支持的 App，用仅绑定本机的 DevTools 端口重新启动，并在 renderer 被替换后重连。使用 `./scripts/install_launch_agent.sh 9222` 可以让这个循环在登录后和客户端更新后持续运行。Codex 被用户主动关闭时 LaunchAgent 只等待；你普通启动客户端后，可能会短暂重启一次以补上 DevTools 参数。若当前正在生成回复，客户端可以把这次重启延后到下次启动。
 
 ## 更新日志
+
+### v0.4.0 (fork)
+
+- 完整轮次/压缩/工具统计、按额度重置周期分摊、覆盖缺口与保守匹配。
+- 流式建立完整历史索引，后续增量读取；不新增第三方运行依赖。
 
 ### v0.3.2
 
@@ -147,14 +161,14 @@ python3 ./scripts/context_token_inspector.py --limit 20 --format table
 | `context window` | Codex token-count 事件里记录的模型上下文窗口上限。 | `model_context_window` |
 | `left` | 当前请求预计剩余 context。 | `context window - context` |
 | `Token: Current` | 当前请求 context 占用量与模型 context window 的比例。 | `last_token_usage.input_tokens / model_context_window` |
-| `Token: Total` | 当前 assistant 回复 token 与当前 session 累计 token 的比例。 | `last_token_usage.total_tokens / total_token_usage.total_tokens` |
+| `Token: Total` | 完整一轮 / 当前会话总 tokens（均包含已记录的压缩）。 | 去重后的原生 usage 求和；旧格式用累计差值 |
 | `session` | Monitor 面板中的当前 session 总消耗，不统计其他会话。 | 最新 session JSONL |
 | `in` | Codex 记录的输入 token。在 Monitor 的 session 行里，它表示当前 session 累计输入。 | `input_tokens` |
 | `cached` | Codex 记录的 cached input token。当重复上下文被复用时，这个值可能较高。 | `cached_input_tokens` |
 | `out` | assistant 生成的输出 token。 | `output_tokens` |
 | `reason` | Codex 记录的 reasoning output token。 | `reasoning_output_tokens` |
-| `user rounds` | 当前 session 中非环境消息的 user message 数量。这个更接近人理解的“对话轮次”。 | 解析 user messages |
-| `assistant rounds` | 当前 session 中带 token-count 记录的 assistant message 数量。一次 user round 里可能出现多个 assistant rounds，因为 Codex 可能先输出进度/状态消息，再输出最终回复。 | 解析带 token usage 的 assistant messages |
+| `user rounds` | 有用量或工具记录的完整任务轮次。旧格式以用户消息分轮。 | 原生 turn_id / 旧格式用户消息 |
+| `assistant rounds` | 有可匹配助手消息的轮次；进度消息不会重复显示整轮消耗。 | 每轮最后一条助手消息 |
 | `status` | context 压力提示。低于 70% 为 `OK`，达到 70% 为 `WATCH`，达到 85% 为 `HIGH`。 | `context / context window` |
 | `raw / K / M` | token 显示单位。`raw` 显示原始整数，`K` 显示千，`M` 显示百万。默认单位是 `K`。 | UI 设置 |
 

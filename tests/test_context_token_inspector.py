@@ -3,10 +3,12 @@ import json
 import os
 import pathlib
 import tempfile
+import sys
 import unittest
 
 
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 SCRIPT_PATH = PLUGIN_ROOT / "scripts" / "context_token_inspector.py"
 INJECTOR_PATH = PLUGIN_ROOT / "scripts" / "context_token_injector.py"
 
@@ -235,7 +237,7 @@ class ContextTokenInspectorTests(unittest.TestCase):
         self.assertNotIn("Context  39,949 / 258,400", payload["summaries"][0]["hover"])
         self.assertNotIn("/tmp/project", payload["summaries"][0]["hover"])
         self.assertEqual(len(payload["detail"]["assistantFooters"]), 1)
-        self.assertEqual(payload["detail"]["assistantChips"][0], "Token: Current 39,949/258,400 (15.5%) | Total 40,416/64,016   Rounds：Assistant 1/1")
+        self.assertEqual(payload["detail"]["assistantChips"][0], "Token: Current 39,949/258,400 (15.5%) | Total 40,416/64,016   Rounds：User 1/1  | Assistant 1/1")
 
     def test_injector_payload_uses_session_rounds_for_historical_replies(self):
         injector = load_injector()
@@ -249,6 +251,7 @@ class ContextTokenInspectorTests(unittest.TestCase):
         for index in range(1, 4):
             rows.extend(
                 [
+                    {"type":"event_msg", "payload":{"type":"task_started", "turn_id":f"t{index}"}},
                     {
                         "timestamp": f"2026-05-22T06:0{index}:10.000Z",
                         "type": "response_item",
@@ -291,7 +294,7 @@ class ContextTokenInspectorTests(unittest.TestCase):
 
         self.assertEqual([item["roundIndex"] for item in items], [1, 2, 3])
         self.assertEqual([item["totalRounds"] for item in items], [3, 3, 3])
-        self.assertTrue(payload["detail"]["assistantChips"][2].endswith("Rounds：Assistant 3/3"))
+        self.assertTrue(payload["detail"]["assistantChips"][2].endswith("Rounds：User 3/3  | Assistant 3/3"))
 
     def test_rounds_count_user_turns_not_assistant_status_messages(self):
         injector = load_injector()
@@ -389,10 +392,10 @@ class ContextTokenInspectorTests(unittest.TestCase):
         payload = injector.build_payload([str(session.parent)], limit=10, selected_thread_id="019e4e4a-demo")
         items = payload["detail"]["assistantItems"]
 
-        self.assertEqual([item["roundIndex"] for item in items], [1, 2, 2])
-        self.assertEqual([item["totalRounds"] for item in items], [2, 2, 2])
-        self.assertTrue(payload["detail"]["assistantChips"][0].endswith("Rounds：User 1/2  | Assistant 1/3"))
-        self.assertTrue(payload["detail"]["assistantChips"][2].endswith("Rounds：User 2/2  | Assistant 3/3"))
+        self.assertEqual([item["roundIndex"] for item in items], [1, 2])
+        self.assertEqual([item["totalRounds"] for item in items], [2, 2])
+        self.assertTrue(payload["detail"]["assistantChips"][0].endswith("Rounds：User 1/2  | Assistant 1/2"))
+        self.assertTrue(payload["detail"]["assistantChips"][1].endswith("Rounds：User 2/2  | Assistant 2/2"))
 
     def test_injector_payload_prefers_latest_session_over_stale_active_thread(self):
         injector = load_injector()
@@ -411,6 +414,7 @@ class ContextTokenInspectorTests(unittest.TestCase):
             for index in range(1, replies + 1):
                 rows.extend(
                     [
+                        {"type":"event_msg", "payload":{"type":"task_started", "turn_id":f"t{index}"}},
                         {
                             "timestamp": f"2026-05-22T06:{index:02d}:10.000Z",
                             "type": "response_item",
@@ -449,7 +453,7 @@ class ContextTokenInspectorTests(unittest.TestCase):
         self.assertEqual(payload["selectedThreadId"], "019e4e4a-new")
         self.assertEqual(payload["detail"]["thread_id"], "019e4e4a-new")
         self.assertEqual(len(payload["detail"]["assistantItems"]), 2)
-        self.assertTrue(payload["detail"]["assistantChips"][1].endswith("Rounds：Assistant 2/2"))
+        self.assertTrue(payload["detail"]["assistantChips"][1].endswith("Rounds：User 2/2  | Assistant 2/2"))
 
     def test_injector_payload_includes_active_session_detail_outside_default_window(self):
         injector = load_injector()
@@ -565,7 +569,7 @@ class ContextTokenInspectorTests(unittest.TestCase):
         script = injector.INJECTION_SCRIPT
         bootstrap = script.split("installSidebarHoverDelegation();", 1)[1].split("installObserver(payload);", 1)[0]
 
-        self.assertIn("const RUNTIME_VERSION = 6;", script)
+        self.assertIn("const RUNTIME_VERSION = 7;", script)
         self.assertIn("if (!runtimeChanged) return;", script)
         self.assertIn("document.getElementById(ROOT_ID)?.remove();", script)
         self.assertIn("__codexContextTokenInspectorObserver?.disconnect", script)
@@ -578,7 +582,7 @@ class ContextTokenInspectorTests(unittest.TestCase):
         script = injector.INJECTION_SCRIPT
         apply_all = script.split("function applyAll(payload)", 1)[1].split("function installObserver(payload)", 1)[0]
 
-        self.assertIn("const currentDetail = detailForCurrentThread(payload) || detailForVisiblePage(payload);", apply_all)
+        self.assertIn("const currentDetail = detailForCurrentThread(payload);", apply_all)
         self.assertIn("applyHud(payload, currentDetail);", apply_all)
         self.assertNotIn("applyHud(payload, detailForCurrentThread(payload));", apply_all)
 

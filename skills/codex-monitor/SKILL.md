@@ -16,13 +16,13 @@ Codex Monitor is local and read-only. It does not patch `ChatGPT.app`, `Codex.ap
 Use the repository URL:
 
 ```text
-https://github.com/KevinKE93/Codex-Monitor
+https://github.com/Lywooye/Codex-Monitor
 ```
 
 Codex CLI equivalent:
 
 ```bash
-codex plugin marketplace add https://github.com/KevinKE93/Codex-Monitor --ref main
+codex plugin marketplace add https://github.com/Lywooye/Codex-Monitor --ref main
 codex plugin add codex-monitor@codex-monitor
 ```
 
@@ -38,7 +38,7 @@ From the plugin root:
 
 This discovers either the current `ChatGPT.app` bundle or the legacy `Codex.app`, reopens it with a local DevTools port, injects the monitor, and loops so the overlay is restored after renderer restarts.
 The injector refreshes the session payload every 10 seconds by default while the in-page observer handles ordinary UI changes.
-For responsiveness, sidebar hover summaries cover the latest 100 sessions while per-message chip details are parsed for the latest 6 sessions by default. Use `--detail-limit` on `context_token_injector.py` if older sessions need chips.
+For responsiveness, sidebar hover summaries cover the latest 100 sessions while per-message chip details are parsed for the latest 6 sessions by default. The selected session is included even outside that window. All local sessions remain in the quota denominator; initial history indexing is streamed and subsequent reads are incremental.
 If the requested port is occupied, the scripts reuse it only when it owns a Codex renderer; otherwise they choose the next available local port.
 Injected labels use Chinese when the Codex interface language starts with `zh`; English is the fallback for every other language.
 
@@ -79,8 +79,12 @@ If the desktop app upgrades or restarts, injected DOM elements disappear because
 
 ## Interpretation
 
-- `context` uses the current request's `last_token_usage.input_tokens` divided by `model_context_window`.
-- `turn token` uses the current response's `last_token_usage.total_tokens`.
-- `total token` and Monitor `session` use cumulative `total_token_usage` for the current session only.
-- `user rounds` counts non-environment user messages in the current session JSONL.
-- `assistant rounds` counts assistant messages with token-count records in the current session JSONL.
+- Context usage is the latest request input divided by its reported context window.
+- Turn usage sums native response-ID-deduplicated records for a task, including recorded compaction; token_count mirrors are not added again. Legacy turns use advancing cumulative deltas.
+- Session totals include all observed turns in the same thread. A known legacy cumulative prefix is included in the total but cannot be assigned to a turn/time. Native inherited fork records are excluded; separate agent threads are not merged.
+- Tool counts use call IDs, with names and returned counts. Returned does not mean successful; tool arguments/results are not shown.
+- Weekly quota is an estimate, never exact attribution: divide each observed same-cycle account percentage increment by local token shares. Show current %, per-cycle breakdown, lifetime percentage points, coverage and gaps. Do not bridge resets or invent a zero baseline.
+- Other devices, model weighting, snapshot rounding/delay and unreadable history cause unknown error. Do not claim a numerical confidence interval or that token coverage equals quota accuracy.
+- Chips appear only on a turn's last assistant message, matched within the identified chat by turn ID or unique text. Do not guess by position.
+
+See `docs/ACCOUNTING.md` for details. Installation, app relaunch and autostart remain separate actions from read-only inspection.
